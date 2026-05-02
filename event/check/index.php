@@ -103,8 +103,11 @@ $payload_2["event_state_next_timestamp"] = (string)($body["event_state_next_time
 */
 
 // ✅ Publish into THIS player's current room stream (SSE will receive it)
+$state = $event["current_state"] ?? null;
+if ($state === "active" || $state === "build_up") {
 publish_event($pdo, $room_id, "shard:raid-boss-state-changed", $payload);
-
+}
+ 
 // Optional: keep player online
 $pdo->prepare("UPDATE users SET last_seen = NOW() WHERE player_id = ? LIMIT 1")->execute([$player_id]);
 

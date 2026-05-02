@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 if(isset($_GET['logout'])){
-require __DIR__ . "/db.php"; // adjust path if needed
+require __DIR__ . "/auth.php";
 
 if (session_status() !== PHP_SESSION_ACTIVE) {
   session_start();

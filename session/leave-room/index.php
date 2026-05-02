@@ -21,28 +21,26 @@ if ($session_id === "") {
     exit;
 }
 
-// ✅ Must be authenticated to leave
-$user = require_user_by_session($pdo, $session_id);
-$player_id = (string)$user["player_id"];
+$stmt = $pdo->prepare("
+    SELECT player_id, room_id
+    FROM users
+    WHERE session_id = ?
+    LIMIT 1
+");
+$stmt->execute([$session_id]);
+$session = $stmt->fetch(PDO::FETCH_ASSOC);
 
-// Find which room they are currently in
-$stmt = $pdo->prepare("SELECT room_id FROM room_presence WHERE player_id = ? LIMIT 1");
-$stmt->execute([$player_id]);
-$room_id = $stmt->fetchColumn();
-
-if (!$room_id) {
-    // Not in any room — nothing to remove
-    echo json_encode(["success" => true, "left" => false], JSON_UNESCAPED_SLASHES);
+if (!$session) {
+    http_response_code(404);
+    echo json_encode([
+        "success" => false,
+        "error" => "Invalid session"
+    ]);
     exit;
 }
 
-// ✅ Remove them from presence (this stops “ghost players”)
-$del = $pdo->prepare("DELETE FROM room_presence WHERE player_id = ? LIMIT 1");
-$del->execute([$player_id]);
-
-// ✅ Also clear stream cursor for that room (optional but recommended)
-$cur = $pdo->prepare("DELETE FROM room_stream_cursor WHERE player_id = ? AND room_id = ? LIMIT 1");
-$cur->execute([$player_id, $room_id]);
+$player_id = $session["player_id"];
+$room_id   = $session["room_id"];
 
 // ✅ Broadcast leave to everyone still in that room
 publish_event($pdo, (string)$room_id, "room:user-removed", [

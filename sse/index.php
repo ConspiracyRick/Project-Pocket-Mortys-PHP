@@ -19,7 +19,6 @@ require __DIR__ . "/../lib/auth.php";
 require __DIR__ . "/../lib/events.php"; // provides sse_send()
 
 // ---------------- SSE HELPERS ----------------
-
 function sse_send_id(string $event, string $dataJson, ?int $id = null): void {
     //if ($id !== null) echo "id: {$id}\n"; // enable if you want EventSource resume support
     echo "event: {$event}\n";
@@ -79,60 +78,93 @@ function room_max_event_id(PDO $pdo, string $room_id): int {
     return (int)$q->fetchColumn();
 }
 
-/**
- * Normalize room:wild-morty-added payload so client always gets clickable WORLD entity.
- * Many DB rows are the "short shape" missing state/division/etc.
- */
-function normalize_wild_morty_added(string $payloadJson): string {
-    $d = json_decode($payloadJson, true);
-    if (!is_array($d)) return $payloadJson;
 
-    $wildId  = isset($d["wild_morty_id"]) ? (string)$d["wild_morty_id"] : "";
-    $mortyId = isset($d["morty_id"]) ? (string)$d["morty_id"] : "";
-    $place   = $d["placement"] ?? null;
+/* ---------------- ACTIVE DECK MORTIES ---------------- */
+function get_active_deck_morties(PDO $pdo, string $player_id): array {
 
-    if ($wildId === "" || $mortyId === "" || !is_array($place) || count($place) !== 2) {
-        return $payloadJson;
+    /* ---------------- 1. GET ACTIVE DECK ---------------- */
+    $q = $pdo->prepare("
+        SELECT deck_id, owned_morty_ids
+        FROM decks
+        WHERE player_id = ?
+        LIMIT 1
+    ");
+    $q->execute([$player_id]);
+    $deck = $q->fetch(PDO::FETCH_ASSOC);
+
+    if (!$deck || !$deck["owned_morty_ids"]) {
+        return [];
     }
 
-    $placement = [(int)$place[0], (int)$place[1]];
+    $raw = $deck["owned_morty_ids"];
 
-    $state   = (isset($d["state"]) && $d["state"] !== "" && $d["state"] !== null) ? (string)$d["state"] : "WORLD";
-    $variant = (isset($d["variant"]) && $d["variant"] !== "" && $d["variant"] !== null) ? (string)$d["variant"] : "Normal";
+    /* ---------------- 2. PARSE MORTY IDS ---------------- */
+    $morty_ids = json_decode($raw, true);
 
-    $division = 1;
-    if (isset($d["division"])) {
-        $division = (int)$d["division"];
-        if ($division <= 0) $division = 1;
+    if (!is_array($morty_ids)) {
+        // fallback if stored as CSV
+        $morty_ids = array_filter(array_map('trim', explode(',', $raw)));
     }
 
-    $shinyIfPotion = false;
-    if (isset($d["shiny_if_potion"])) {
-        $shinyIfPotion = (bool)$d["shiny_if_potion"];
+    if (empty($morty_ids)) {
+        return [];
     }
 
-    $created = isset($d["_created"]) ? (string)$d["_created"] : "";
-    $updated = isset($d["_updated"]) ? (string)$d["_updated"] : "";
+    /* ---------------- 3. LOAD MORTIES ---------------- */
+    $in = implode(',', array_fill(0, count($morty_ids), '?'));
 
-    if ($created === "" || $updated === "") {
-        $now = gmdate("Y-m-d\\TH:i:s") . ".000Z";
-        if ($created === "") $created = $now;
-        if ($updated === "") $updated = $now;
+    $q = $pdo->prepare("
+        SELECT 
+            owned_morty_id,
+            morty_id,
+            hp,
+            variant,
+            is_locked,
+            is_trading_locked,
+            fight_pit_id
+        FROM owned_morties
+        WHERE owned_morty_id IN ($in)
+    ");
+    $q->execute($morty_ids);
+
+    $morties = $q->fetchAll(PDO::FETCH_ASSOC);
+
+    /* ---------------- 4. NORMALIZE TYPES ---------------- */
+    foreach ($morties as &$m) {
+        $m["hp"] = (int)$m["hp"];
+
+        $m["is_locked"] = filter_var(
+            $m["is_locked"],
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        $m["is_trading_locked"] = filter_var(
+            $m["is_trading_locked"],
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        $m["fight_pit_id"] = (
+    empty($m["fight_pit_id"]) ||
+    strtolower((string)$m["fight_pit_id"]) === "null"
+)
+    ? null
+    : $m["fight_pit_id"];
+    }
+    unset($m);
+
+    /* ---------------- 5. PRESERVE ORIGINAL DECK ORDER ---------------- */
+    $ordered = [];
+
+    foreach ($morty_ids as $id) {
+        foreach ($morties as $m) {
+            if ($m["owned_morty_id"] === $id) {
+                $ordered[] = $m;
+                break;
+            }
+        }
     }
 
-    $out = [
-        "morty_id" => $mortyId,
-        "placement" => $placement,
-        "state" => $state,
-        "division" => $division,
-        "variant" => $variant,
-        "shiny_if_potion" => $shinyIfPotion,
-        "_created" => $created,
-        "_updated" => $updated,
-        "wild_morty_id" => $wildId,
-    ];
-
-    return json_encode($out, JSON_UNESCAPED_SLASHES);
+    return $ordered;
 }
 
 // -------------------- AUTH --------------------
@@ -185,7 +217,7 @@ $session = [
     "ping_interval" => 30,
     "ping_url" => $ping_url,
     "keep_alive" => 30,
-    "server_instance" => "/ip-54-196-181-23/1/1143",
+    "server_instance" => "/ip-10-100-0-46/0/1142",
     "worlds" => [
         ["world_id"=>"1","player_level"=>["min"=>1,"max"=>50]],
         ["world_id"=>"2","player_level"=>["min"=>5,"max"=>50]],
@@ -236,71 +268,112 @@ $fresh_connect = ($client_last_event_id === null);
 // -------------------- INITIAL SNAPSHOT (ONLY ON FRESH CONNECT) --------------------
 
 if ($fresh_connect) {
-    // other users in room (no self)
-    $u = $pdo->prepare("
-        SELECT player_id, username, player_avatar_id, level, state
-        FROM users
-        WHERE room_id = ?
-          AND last_seen >= (NOW() - INTERVAL 5 MINUTE)
-    ");
-    $u->execute([$room_id]);
-
-    while ($row = $u->fetch(PDO::FETCH_ASSOC)) {
-        if ((string)$row["player_id"] === $player_id) continue;
-
-        sse_send("room:user-added", json_encode([
-            "player_id" => (string)$row["player_id"],
-            "username" => (string)$row["username"],
-            "player_avatar_id" => (string)$row["player_avatar_id"],
-            "level" => (int)$row["level"],
-            "state" => (string)($row["state"] ?: "WORLD"),
-        ], JSON_UNESCAPED_SLASHES));
-    }
-
-    // pickups alive only
-    $p = $pdo->prepare("
-        SELECT id, payload_json
+    // ---------------- PICKUPS ----------------
+    $pickupStmt = $pdo->prepare("
+        SELECT id, pickup_id, placement, pick_up_contents
         FROM event_queue
         WHERE room_id = ?
-          AND event_name = 'room:pickup-added'
-          AND pickup_id_collected_by_player_id IS NULL
+        AND event_name = 'room:pickup-added'
+        AND pickup_id_collected_by_player_id IS NULL
         ORDER BY id ASC
     ");
-    $p->execute([$room_id]);
-    while ($row = $p->fetch(PDO::FETCH_ASSOC)) {
-        sse_send_id("room:pickup-added", (string)$row["payload_json"], (int)$row["id"]);
+    $pickupStmt->execute([$room_id]);
+
+    while ($p = $pickupStmt->fetch(PDO::FETCH_ASSOC)) {
+
+        $placement = explode(",", $p["placement"] ?? "0,0");
+
+        $payload = [
+            "pickup_id" => $p["pickup_id"],
+            "placement" => [
+                (int)($placement[0] ?? 0),
+                (int)($placement[1] ?? 0)
+            ],
+            "contents" => json_decode($p["pick_up_contents"], true) ?? []
+        ];
+
+        sse_send_id(
+            "room:pickup-added",
+            json_encode($payload, JSON_UNESCAPED_SLASHES),
+            (int)$p["id"]
+        );
     }
 
-    // wild mortys - normalize payload so they become interactable
-    $w = $pdo->prepare("
-        SELECT id, payload_json
+    // ---------------- WILD MORTIES ----------------
+    $wildStmt = $pdo->prepare("
+        SELECT id, wild_morty_id, morty_id, placement, state, division, variant, shiny_if_potion
         FROM event_queue
         WHERE room_id = ?
-          AND event_name = 'room:wild-morty-added'
+        AND event_name = 'room:wild-morty-added'
         ORDER BY id ASC
     ");
-    $w->execute([$room_id]);
-    while ($row = $w->fetch(PDO::FETCH_ASSOC)) {
-        $payload = normalize_wild_morty_added((string)$row["payload_json"]);
-        sse_send_id("room:wild-morty-added", $payload, (int)$row["id"]);
+    $wildStmt->execute([$room_id]);
+
+    while ($w = $wildStmt->fetch(PDO::FETCH_ASSOC)) {
+
+        $placement = explode(",", $w["placement"] ?? "0,0");
+
+        $payload = [
+            "morty_id" => $w["morty_id"],
+            "placement" => [
+                (int)($placement[0] ?? 0),
+                (int)($placement[1] ?? 0)
+            ],
+            "state" => $w["state"] ?: "WORLD",
+            "division" => (int)($w["division"] ?: 1),
+            "variant" => $w["variant"] ?: "Normal",
+            "shiny_if_potion" => (bool)$w["shiny_if_potion"],
+            "_created" => gmdate("Y-m-d\\TH:i:s").".000Z",
+            "_updated" => gmdate("Y-m-d\\TH:i:s").".000Z",
+            "wild_morty_id" => $w["wild_morty_id"]
+        ];
+
+        sse_send_id(
+            "room:wild-morty-added",
+            json_encode($payload, JSON_UNESCAPED_SLASHES),
+            (int)$w["id"]
+        );
     }
 
-    // bots
-    $b = $pdo->prepare("
-        SELECT id, payload_json
+    // ---------------- BOTS ----------------
+    $botStmt = $pdo->prepare("
+        SELECT id, bot_id, username, player_avatar_id, placement, state, owned_morties
         FROM event_queue
         WHERE room_id = ?
-          AND event_name = 'room:bot-added'
+        AND event_name = 'room:bot-added'
         ORDER BY id ASC
     ");
-    $b->execute([$room_id]);
-    while ($row = $b->fetch(PDO::FETCH_ASSOC)) {
-        sse_send_id("room:bot-added", (string)$row["payload_json"], (int)$row["id"]);
+    $botStmt->execute([$room_id]);
+
+    while ($b = $botStmt->fetch(PDO::FETCH_ASSOC)) {
+
+        $placement = explode(",", $b["placement"] ?? "0,0");
+
+        $payload = [
+            "username" => $b["username"],
+            "player_avatar_id" => $b["player_avatar_id"],
+            "state" => $b["state"] ?: "WORLD",
+            "level" => 1,
+            "owned_morties" => json_decode($b["owned_morties"], true) ?? [],
+            "streak" => 0,
+            "bot_id" => $b["bot_id"],
+            "placement" => [
+                (int)($placement[0] ?? 0),
+                (int)($placement[1] ?? 0)
+            ]
+        ];
+
+        sse_send_id(
+            "room:bot-added",
+            json_encode($payload, JSON_UNESCAPED_SLASHES),
+            (int)$b["id"]
+        );
     }
 
-    // After snapshot seed, set cursor to current max so we don't replay snapshot rows
+    // move cursor forward after snapshot
     $last_id = room_max_event_id($pdo, $room_id);
     cursor_set($pdo, $player_id, $last_id);
+
 } else {
     $last_id = (int)$client_last_event_id;
     cursor_set($pdo, $player_id, $last_id);
@@ -311,63 +384,272 @@ if ($fresh_connect) {
 $keepalive_interval_sec = 30;
 $last_keepalive = time();
 
-// These events should only be delivered to the triggering / involved player.
-// (We primarily use event_queue.player_id to decide.)
-$privateEvents = ["battle:start","battle:move-timer-started","battle:turn-result"];
+$privateEvents = [
+    "battle:start",
+    "battle:move-timer-started",
+    "battle:turn-result"
+];
 
 while (!connection_aborted()) {
 
-    // touch presence
-    $pdo->prepare("UPDATE users SET last_seen = NOW() WHERE player_id = ?")
-        ->execute([$player_id]);
+    // keep user online
+    $pdo->prepare("
+        UPDATE users 
+        SET last_seen = NOW() 
+        WHERE player_id = ?
+    ")->execute([$player_id]);
 
-    // IMPORTANT: also fetch event_queue.player_id
     $stmt = $pdo->prepare("
-        SELECT id, event_name, payload_json, player_id AS target_player_id
+        SELECT 
+            id,
+            room_id,
+            event_name,
+			player_id,
+			emote,
+			current_raid,
+			battle_start,
+			battle_turn_result,
+			battle_move_timer_started,
+			bot_id,
+			username,
+			player_avatar_id,
+			wild_morty_id,
+			morty_id,
+			placement,
+			state,
+			division,
+			zone_id,
+			variant,
+			shiny_if_potion,
+            pickup_id,
+            pick_up_contents,
+			owned_morties,
+            only_show_to_player_id
         FROM event_queue
         WHERE room_id = ?
-          AND id > ?
+        AND id > ?
         ORDER BY id ASC
         LIMIT 200
     ");
+
     $stmt->execute([$room_id, $last_id]);
 
     $sent = false;
 
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-        $eventName = (string)$row["event_name"];
-        $payload   = (string)$row["payload_json"];
-        $eid       = (int)$row["id"];
-        $targetPid = (string)($row["target_player_id"] ?? "");
 
-        // ---- PRIVATE EVENT FILTERING ----
+        $eventName = (string)$row["event_name"];
+        $eid = (int)$row["id"];
+        $targetPid = (string)($row["player_id"] ?? "");
+
+        $payload = (string)null;
+
+        // ---------------- PRIVATE EVENT FILTER ----------------
         if (in_array($eventName, $privateEvents, true)) {
-            // Strong rule: if DB has a target player, ONLY send to that player.
+
             if ($targetPid !== "" && $targetPid !== $player_id) {
                 $last_id = $eid;
                 continue;
             }
 
-            // Fallback: if DB target is empty, try to infer from payload
-            if ($targetPid === "" && !payload_involves_player($payload, $player_id)) {
+            if (
+                $targetPid === "" &&
+                !payload_involves_player($payload, $player_id)
+            ) {
                 $last_id = $eid;
                 continue;
             }
         }
 
-        // Normalize wild morty payload shape live too
-        if ($eventName === "room:wild-morty-added") {
-            $payload = normalize_wild_morty_added($payload);
+        // ---------------- REBUILD PICKUP EVENTS ----------------
+        if ($eventName === "room:pickup-added") {
+
+            $placement = explode(",", $row["placement"] ?? "0,0");
+
+            $rebuilt = [
+                "pickup_id" => $row["pickup_id"],
+                "placement" => [
+                    (int)($placement[0] ?? 0),
+                    (int)($placement[1] ?? 0)
+                ],
+                "contents" => json_decode(
+                    $row["pick_up_contents"] ?? "[]",
+                    true
+                ) ?? []
+            ];
+
+            $payload = json_encode(
+                $rebuilt,
+                JSON_UNESCAPED_SLASHES
+            );
         }
 
+        // ---------------- REBUILD WILD EVENTS ----------------
+        elseif ($eventName === "room:wild-morty-added") {
+
+            $placement = explode(",", $row["placement"] ?? "0,0");
+
+            $rebuilt = [
+                "morty_id" => $row["morty_id"],
+                "placement" => [
+                    (int)($placement[0] ?? 0),
+                    (int)($placement[1] ?? 0)
+                ],
+                "state" => $row["state"] ?: "WORLD",
+                "division" => (int)($row["division"] ?: 1),
+                "variant" => $row["variant"] ?: "Normal",
+                "shiny_if_potion" => (bool)$row["shiny_if_potion"],
+                "_created" => gmdate("Y-m-d\\TH:i:s") . ".000Z",
+                "_updated" => gmdate("Y-m-d\\TH:i:s") . ".000Z",
+                "wild_morty_id" => $row["wild_morty_id"]
+            ];
+
+            $payload = json_encode(
+                $rebuilt,
+                JSON_UNESCAPED_SLASHES
+            );
+        }
+
+        // ---------------- REBUILD BOT EVENTS ----------------
+        elseif ($eventName === "room:bot-added") {
+
+            $placement = explode(",", $row["placement"] ?? "0,0");
+
+            $rebuilt = [
+                "username" => $row["username"],
+                "player_avatar_id" => $row["player_avatar_id"],
+                "state" => $row["state"] ?: "WORLD",
+                "level" => 1,
+                "owned_morties" => json_decode(
+                    $row["owned_morties"] ?? "[]",
+                    true
+                ) ?? [],
+                "streak" => 0,
+                "bot_id" => $row["bot_id"],
+                "placement" => [
+                    (int)($placement[0] ?? 0),
+                    (int)($placement[1] ?? 0)
+                ]
+            ];
+
+            $payload = json_encode(
+                $rebuilt,
+                JSON_UNESCAPED_SLASHES
+            );
+        }
+		
+		// ---------------- RAID EVENTS ----------------
+        elseif ($eventName === "shard:raid-boss-state-changed") {
+           $payload = (string)$row["current_raid"];
+		}
+		
+		// ---------------- WILD MORTY STATE CHANGE ----------------
+        elseif ($eventName === "room:wild-morty-state-changed") {
+		   $rebuilt = [
+                "wild_morty_id" => $row["wild_morty_id"],
+                "state" => $row["state"]
+            ];
+
+            $payload = json_encode(
+                $rebuilt,
+                JSON_UNESCAPED_SLASHES
+            );
+		}
+		
+		// ---------------- USER ROOM STATE CHANGE ----------------
+        elseif ($eventName === "room:user-state-changed") {
+		   $rebuilt = [
+                "player_id" => $row["player_id"],
+                "state" => $row["state"]
+            ];
+
+            $payload = json_encode(
+                $rebuilt,
+                JSON_UNESCAPED_SLASHES
+            );
+		}
+		
+		// ---------------- BATTLE START EVENT ----------------
+        elseif ($eventName === "battle:start") {
+           $payload = (string)$row["battle_start"];
+		}
+		
+		// ---------------- BATTLE TURN ----------------
+		elseif ($eventName === "battle:turn-result") {
+           $payload = (string)$row["battle_turn_result"];
+		}
+		
+		// ---------------- BATTLE TIMER ----------------
+		elseif ($eventName === "battle:move-timer-started") {
+           $payload = (string)$row["battle_move_timer_started"];
+		}
+		
+		// ---------------- REMOVE PICKUP ----------------
+        elseif ($eventName === "room:pickup-removed") {
+		   $rebuilt = [
+                "pickup_id" => $row["pickup_id"]
+            ];
+
+            $payload = json_encode(
+                $rebuilt,
+                JSON_UNESCAPED_SLASHES
+            );
+		}
+		
+		// ---------------- EMOTE ----------------
+        elseif ($eventName === "emote:room") {
+		   $rebuilt = [
+                "player_id" => $row["player_id"],
+				"emote" => $row["emote"]
+            ];
+
+            $payload = json_encode(
+                $rebuilt,
+                JSON_UNESCAPED_SLASHES
+            );
+		}
+		
+		// ---------------- ROOM USER ADDED ----------------
+        elseif ($eventName === "room:user-added") {
+		$roomuser = [
+                "player_id" => (string)$user["player_id"],
+                "username" => (string)$user["username"],
+                "player_avatar_id" => (string)$user["player_avatar_id"],
+                "level" => (int)$user["level"],
+                "owned_morties" => get_active_deck_morties($pdo, (string)$user["player_id"]),
+                "state" => (string)($user["state"] ?: "WORLD")
+            ];
+		$payload = json_encode(
+                $roomuser,
+                JSON_UNESCAPED_SLASHES
+            );
+		}
+		
+		// ---------------- ROOM USER LEFT ----------------
+        elseif ($eventName === "room:user-removed") {
+		$roomuser = [
+                "player_id" => (string)$user["player_id"]
+            ];
+		$payload = json_encode(
+                $roomuser,
+                JSON_UNESCAPED_SLASHES
+            );
+		}
+		
+
+        // send the payload to the live SSE
         sse_send_id($eventName, $payload, $eid);
+
         $last_id = $eid;
         $sent = true;
     }
 
     cursor_set($pdo, $player_id, $last_id);
 
-    if (!$sent && (time() - $last_keepalive) >= $keepalive_interval_sec) {
+    if (
+        !$sent &&
+        (time() - $last_keepalive) >= $keepalive_interval_sec
+    ) {
         sse_send("session:keep-alive", "0");
         $last_keepalive = time();
     }

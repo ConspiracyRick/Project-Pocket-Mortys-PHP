@@ -81,32 +81,41 @@ if (!$chk->fetchColumn()) {
     exit;
 }
 
-// ------------------------
-// Get wild morty payload
-// ------------------------
+// New pulls directly from the db
 function get_wild_morty_payload(PDO $pdo, string $room_id, string $wild_morty_id): ?array {
     $stmt = $pdo->prepare("
-        SELECT payload_json
+        SELECT 
+            wild_morty_id,
+            morty_id,
+            placement,
+            state,
+            division,
+            variant,
+            shiny_if_potion,
+            created_at,
+            updated
         FROM event_queue
         WHERE room_id = ?
           AND event_name = 'room:wild-morty-added'
+          AND wild_morty_id = ?
         ORDER BY id DESC
-        LIMIT 50
+        LIMIT 1
     ");
-    $stmt->execute([$room_id]);
 
-    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-        $payload = json_decode($row["payload_json"] ?? "", true);
-        if (!is_array($payload)) continue;
-        if ((string)($payload["wild_morty_id"] ?? "") === $wild_morty_id) {
-            return $payload;
-        }
-    }
-    return null;
+    $stmt->execute([$room_id, $wild_morty_id]);
+
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    return $row ?: null;
 }
-
 $wildPayload = get_wild_morty_payload($pdo, $room_id, $wild_morty_id);
-$wildMortyId = $wildPayload["morty_id"] ?? "MortyFaceHoleSummer";
+if (!$wildPayload) {
+    http_response_code(409);
+    echo json_encode(["success" => false, "error" => "Morty does not exist"], JSON_UNESCAPED_SLASHES);
+    exit;
+}
+$wildMortyId = $wildPayload["morty_id"];
+
 
 // ------------------------
 // Load player and active deck
@@ -191,16 +200,6 @@ if (!empty($deckMortyIds)) {
     }
 }
 
-// fallback
-if ($activeOwnedMorty === "") {
-    foreach ($ownedMortiesRows as $m) {
-        if ((int)$m["hp"] > 0) {
-            $activeOwnedMorty = $m["owned_morty_id"];
-            break;
-        }
-    }
-}
-
 // ------------------------
 // Build owned morties payload (only from active deck)
 // ------------------------
@@ -264,9 +263,21 @@ $playerPayload = [
 $wild_owned_PlayerId = uuidv4();
 
 // Make it based on player level
-$opponentHP = rand(20, 20);
-$level = 5;
-$xp = 1000;
+/*
+$playerRow["level"]
+function Disobedience(int $playerLevel): int {
+    $maximum_obedient = $playerLevel * 2;
+    if ($maximum_obedient > 100) {
+        return 100;
+    }
+    return $maximum_obedient;
+}
+
+*/
+
+$level = 999;
+$xp = 1000000;
+$opponentHP = rand(1, 1);
 
 $opponentPayload = [
     "player_id"=>$wild_owned_PlayerId,

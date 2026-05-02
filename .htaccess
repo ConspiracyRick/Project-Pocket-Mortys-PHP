@@ -263,16 +263,8 @@ RewriteRule ^session/use-item$ /session/use-item/ [L]
 RewriteCond %{REQUEST_URI} ^/sp/gacha-info$
 RewriteRule ^sp/gacha-info$ /sp/gacha-info/ [L]
 
-RewriteCond %{REQUEST_URI} ^/api/login$
-RewriteRule ^api/login$ /api/login/ [L]
-
-RewriteCond %{REQUEST_URI} ^/api/games$
-RewriteRule ^api/games$ /api/games/ [L]
-
-RewriteCond %{REQUEST_URI} ^/api/play$
-RewriteRule ^api/play$ /api/play/ [L]
-
-
+RewriteCond %{REQUEST_URI} ^/time$
+RewriteRule ^time$ /time/ [L]
 
 <Files "manifest.json">
     ForceType application/octet-stream
@@ -285,7 +277,7 @@ RewriteRule ^manifest\.json$ - [L]
 RewriteRule ^rat\.json$ - [L]
 
 # allow your API paths
-RewriteRule ^(api|phpmyadmin|sp|lib|gacha-info|is-gdpr|AssetBundles|AssetBundle-android:1011-ios:1011__7b175320|Aliases|rat|Android|Status|user|login|sse|session|ping-dynamic|inappdeletion|get-account-data-storage-time|iap|display|list|morty|slots|config|arena|rewards|pending|decks|trading|event|events|moving-mortys|lte|fyre|promos|shard)/ - [L]
+RewriteRule ^(newc137|api|phpmyadmin|sp|lib|gacha-info|is-gdpr|AssetBundles|AssetBundle-android:1011-ios:1011__7b175320|Aliases|rat|Android|Status|user|login|sse|session|ping-dynamic|inappdeletion|get-account-data-storage-time|iap|display|list|morty|slots|config|arena|rewards|pending|decks|trading|event|events|moving-mortys|lte|fyre|promos|shard)/ - [L]
 
 # block everything else
-RewriteRule ^ - [F,L]
+#RewriteRule ^ - [F,L]

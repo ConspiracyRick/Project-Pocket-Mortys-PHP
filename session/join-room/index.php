@@ -1,343 +1,323 @@
 <?php
-// join-room.php
+// join-room
 
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
-ini_set('display_startup_errors', 1);
 
 header("Content-Type: application/json; charset=utf-8");
 
 require __DIR__ . "/../../pocket_f4894h398r8h9w9er8he98he.php";
 require_once __DIR__ . "/../../lib/events.php";
-require_once __DIR__ . "/../../lib/room_entities.php";
+//require_once __DIR__ . "/../../lib/room_entities.php";
+
+function iso8601_z($date = null): string {
+    $ts = $date ? strtotime($date) : time();
+    return gmdate("Y-m-d\\TH:i:s.000\\Z", $ts);
+}
 
 $body = json_decode(file_get_contents("php://input"), true) ?: [];
+
 $session_id = (string)($body["session_id"] ?? "");
 $world_id_in = (string)($body["world_id"] ?? "");
 
-// optional: allow client to request a specific room_id
-//$requested_room_id = isset($body["room_id"]) ? (string)$body["room_id"] : "";
-
-if ($session_id === "" || $world_id_in === "") {
-  http_response_code(400);
-  echo json_encode(["error" => "Missing session_id or world_id"], JSON_UNESCAPED_SLASHES);
-  exit;
+if (!$session_id || !$world_id_in) {
+    http_response_code(400);
+    echo json_encode([
+        "error" => "Missing session_id or world_id"
+    ]);
+    exit;
 }
 
-// --- Auth: session_id -> user ---
+/* ---------------- AUTH ---------------- */
+
 $stmt = $pdo->prepare("
-  SELECT player_id, username, player_avatar_id, level
-  FROM users
-  WHERE session_id = ?
-  LIMIT 1
+    SELECT player_id, username, player_avatar_id, level, active_deck_id
+    FROM users
+    WHERE session_id = ?
+    LIMIT 1
 ");
 $stmt->execute([$session_id]);
+
 $me = $stmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$me) {
-  http_response_code(401);
-  echo json_encode(["error" => "Not authenticated"], JSON_UNESCAPED_SLASHES);
-  exit;
+    http_response_code(401);
+    echo json_encode([
+        "error" => "Not authenticated"
+    ]);
+    exit;
 }
 
-$my_player_id = (string)$me["player_id"];
+$player_id = $me["player_id"];
 
-// ------------------------------------------------------------
-// Helpers: room row + entity presence
-// ------------------------------------------------------------
-function fetch_room_row(PDO $pdo, string $room_id): ?array {
-  $q = $pdo->prepare("
+/* ---------------- ROOM PICK ---------------- */
+
+$roomStmt = $pdo->prepare("
     SELECT room_id, room_udp_host, room_udp_port, world_id, zone_id
     FROM room_ids
-    WHERE room_id = ?
+    WHERE world_id = ?
     LIMIT 1
-  ");
-  $q->execute([$room_id]);
-  $r = $q->fetch(PDO::FETCH_ASSOC);
-  return $r ? $r : null;
+");
+$roomStmt->execute([$world_id_in]);
+
+$room = $roomStmt->fetch(PDO::FETCH_ASSOC);
+
+if (!$room) {
+    http_response_code(400);
+    echo json_encode([
+        "error" => "NO_ROOM_FOUND"
+    ]);
+    exit;
 }
 
-function room_has_entities(PDO $pdo, string $room_id): bool {
-  // Fast check:
-  // - any active pickup (added but not collected)
-  // - OR any wild-morty-added
-  // - OR any bot-added
-  $st = $pdo->prepare("
-    SELECT 1
+$room_id = $room["room_id"];
+
+/* ---------------- UPDATE PLAYER ---------------- */
+
+$update = $pdo->prepare("
+    UPDATE users
+    SET room_id = ?,
+        state = 'WORLD',
+        last_seen = NOW()
+    WHERE player_id = ?
+");
+$update->execute([$room_id, $player_id]);
+
+/* ---------------- BASELINE EVENT ---------------- */
+
+$baselineStmt = $pdo->prepare("
+    SELECT COALESCE(MAX(id),0)
     FROM event_queue
     WHERE room_id = ?
-      AND (
-        (event_name = 'room:pickup-added' AND pickup_id_collected_by_player_id IS NULL)
-        OR event_name = 'room:wild-morty-added'
-        OR event_name = 'room:bot-added'
-      )
-    LIMIT 1
-  ");
-  $st->execute([$room_id]);
-  return (bool)$st->fetchColumn();
-}
-
-// ------------------------------------------------------------
-// Choose room (MUST already have entities)
-// ------------------------------------------------------------
-$roomRow = null;
-
-/*
-// Option A: if client requested a room_id and it exists, use it ONLY if it has entities
-if ($requested_room_id !== "") {
-  $roomRow = fetch_room_row($pdo, $requested_room_id);
-  if (!$roomRow) {
-    http_response_code(404);
-    echo json_encode(["error" => "Requested room_id not found"], JSON_UNESCAPED_SLASHES);
-    exit;
-  }
-  if (!room_has_entities($pdo, (string)$roomRow["room_id"])) {
-    http_response_code(400);
-    echo json_encode([
-      "error" => "ROOM_EMPTY",
-      "detail" => "Requested room is not available.",
-      "room_id" => (string)$roomRow["room_id"]
-    ], JSON_UNESCAPED_SLASHES);
-    exit;
-  }
-}
-*/
-
-if (!$roomRow) {
-  $q = $pdo->prepare("
-    SELECT r.room_id, r.room_udp_host, r.room_udp_port, r.world_id, r.zone_id
-    FROM room_ids r
-    LEFT JOIN users u
-      ON u.room_id = r.room_id
-     AND u.last_seen >= (NOW() - INTERVAL 5 MINUTE)
-    WHERE EXISTS (
-      SELECT 1
-      FROM event_queue e
-      WHERE e.room_id = r.room_id
-        AND (
-          (e.event_name = 'room:pickup-added' AND e.pickup_id_collected_by_player_id IS NULL)
-          OR e.event_name = 'room:wild-morty-added'
-          OR e.event_name = 'room:bot-added'
-        )
-      LIMIT 1
-    )
-    GROUP BY r.room_id, r.room_udp_host, r.room_udp_port, r.world_id, r.zone_id
-    ORDER BY COUNT(u.player_id) ASC, r.room_id ASC
-    LIMIT 1
-  ");
-  $q->execute();
-  $roomRow = $q->fetch(PDO::FETCH_ASSOC);
-
-  if (!$roomRow) {
-    // No rooms have entities yet; DO NOT join an empty room.
-    http_response_code(400);
-    echo json_encode([
-      "error" => "NO_READY_ROOMS",
-      "detail" => "No rooms currently available."
-    ], JSON_UNESCAPED_SLASHES);
-    exit;
-  }
-}
-
-$room_id = (string)$roomRow["room_id"];
-$room_udp_host = (string)($roomRow["room_udp_host"] ?? "");
-$room_udp_port = (string)($roomRow["room_udp_port"] ?? "");
-
-$world_id = (string)($roomRow["world_id"] ?? "");
-$zone_id  = (string)($roomRow["zone_id"] ?? "");
-
-// ------------------------------------------------------------
-// Update presence in users table
-// ------------------------------------------------------------
-$up = $pdo->prepare("
-  UPDATE users
-  SET
-    room_id = ?,
-    username = ?,
-    player_avatar_id = ?,
-    level = ?,
-    state = 'WORLD',
-    last_seen = NOW()
-  WHERE player_id = ?
-  LIMIT 1
 ");
+$baselineStmt->execute([$room_id]);
 
-$up->execute([
-  $room_id,
-  (string)$me["username"],
-  (string)$me["player_avatar_id"],
-  (int)$me["level"],
-  $my_player_id,
-]);
-
-// ------------------------------------------------------------
-// Baseline cursor (NO SEEDING HERE)
-// ------------------------------------------------------------
-$maxBefore = $pdo->prepare("SELECT COALESCE(MAX(id), 0) FROM event_queue WHERE room_id = ?");
-$maxBefore->execute([$room_id]);
-$baseline_event_id = (int)$maxBefore->fetchColumn();
+$baseline_event_id = (int)$baselineStmt->fetchColumn();
 
 $pdo->prepare("
-  UPDATE users
-  SET last_event_id = ?, last_seen = NOW(), room_id = ?
-  WHERE player_id = ?
-  LIMIT 1
-")->execute([$baseline_event_id, $room_id, $my_player_id]);
+    UPDATE users
+    SET last_event_id = ?
+    WHERE player_id = ?
+")->execute([$baseline_event_id, $player_id]);
 
-// ------------------------------------------------------------
-// Snapshot: users currently in this room
-// ------------------------------------------------------------
-$pres = $pdo->prepare("
-  SELECT player_id, username, player_avatar_id, level, state
-  FROM users
-  WHERE room_id = ?
-    AND last_seen >= (NOW() - INTERVAL 5 MINUTE)
-  ORDER BY last_seen DESC
-");
-$pres->execute([$room_id]);
-$present_users = $pres->fetchAll(PDO::FETCH_ASSOC);
-
-// Incentive (safe default)
-$incentive = [
-  "incentive_id" => "NPCAd",
-  "rewards" => [
-    ["type" => "ITEM", "amount" => 1, "item_id" => "ItemSerum", "rarity" => 100],
-    ["type" => "ITEM", "amount" => 1, "item_id" => "ItemParalysisCure", "rarity" => 75],
-    ["type" => "COIN", "amount" => 200],
-  ],
-  "token" => ""
-];
-
-// Build morties map for everyone in room (ACTIVE DECK ONLY)
-$player_ids = array_values(array_unique(array_map(fn($r) => (string)$r["player_id"], $present_users)));
-$morties_by_player = [];
-
-if (count($player_ids) > 0) {
-  $placeholders = implode(",", array_fill(0, count($player_ids), "?"));
-
-  $q = $pdo->prepare("
-    SELECT
-      u.player_id,
-      u.active_deck_id,
-      d.owned_morty_ids
-    FROM users u
-    LEFT JOIN decks d
-      ON d.player_id = u.player_id
-     AND d.deck_id  = u.active_deck_id
-    WHERE u.player_id IN ($placeholders)
-      AND u.last_seen >= (NOW() - INTERVAL 5 MINUTE)
-  ");
-  $q->execute($player_ids);
-
-  $deck_ids_by_player = [];
-  while ($r = $q->fetch(PDO::FETCH_ASSOC)) {
-    $pid = (string)$r["player_id"];
-    $json = $r["owned_morty_ids"] ?? "[]";
-    $ids = json_decode($json, true);
-    if (!is_array($ids)) $ids = [];
-
-    $ids = array_values(array_filter(array_map(fn($x) => is_string($x) ? trim($x) : "", $ids), fn($x) => $x !== ""));
-    $deck_ids_by_player[$pid] = $ids;
-
-    if (!isset($morties_by_player[$pid])) $morties_by_player[$pid] = [];
-  }
-
-  $all_deck_owned_ids = [];
-  foreach ($deck_ids_by_player as $ids) {
-    foreach ($ids as $id) $all_deck_owned_ids[$id] = true;
-  }
-  $all_deck_owned_ids = array_keys($all_deck_owned_ids);
-
-  if (count($all_deck_owned_ids) > 0) {
-    $ph2 = implode(",", array_fill(0, count($all_deck_owned_ids), "?"));
-
-    $mstmt = $pdo->prepare("
-      SELECT
+/* ---------------- USERS ---------------- */
+$usersStmt = $pdo->prepare("
+    SELECT 
         player_id,
-        owned_morty_id,
-        morty_id,
-        hp,
-        variant,
-        is_locked,
-        is_trading_locked,
-        fight_pit_id
-      FROM owned_morties
-      WHERE owned_morty_id IN ($ph2)
-      ORDER BY id ASC
-    ");
-    $mstmt->execute($all_deck_owned_ids);
+        username,
+        player_avatar_id,
+        level,
+        state
+    FROM users
+    WHERE room_id = ?
+      AND last_seen >= (NOW() - INTERVAL 1 MINUTE)
+");
+$usersStmt->execute([$room_id]);
 
-    $morty_row_by_owned_id = [];
-    while ($m = $mstmt->fetch(PDO::FETCH_ASSOC)) {
-      $oid = (string)$m["owned_morty_id"];
-
-      $is_locked = ($m["is_locked"] === "true" || $m["is_locked"] === "1" || $m["is_locked"] === 1);
-      $is_trading_locked = ($m["is_trading_locked"] === "true" || $m["is_trading_locked"] === "1" || $m["is_trading_locked"] === 1);
-
-      $morty_row_by_owned_id[$oid] = [
-        "owned_morty_id" => $oid,
-        "morty_id" => (string)$m["morty_id"],
-        "hp" => (int)$m["hp"],
-        "variant" => $m["variant"] ?: "Normal",
-        "is_locked" => (bool)$is_locked,
-        "is_trading_locked" => (bool)$is_trading_locked,
-        "fight_pit_id" => ($m["fight_pit_id"] === null || $m["fight_pit_id"] === "null") ? null : (string)$m["fight_pit_id"]
-      ];
-    }
-
-    foreach ($deck_ids_by_player as $pid => $ids) {
-      $out = [];
-      foreach ($ids as $oid) {
-        if (isset($morty_row_by_owned_id[$oid])) $out[] = $morty_row_by_owned_id[$oid];
-      }
-      $morties_by_player[$pid] = $out;
-    }
-  } else {
-    foreach ($player_ids as $pid) {
-      if (!isset($morties_by_player[$pid])) $morties_by_player[$pid] = [];
-    }
-  }
-}
-
-// Assemble users array
 $users = [];
-foreach ($present_users as $u) {
-  $pid = (string)$u["player_id"];
-  $users[] = [
-    "player_id" => $pid,
-    "username" => (string)$u["username"],
-    "player_avatar_id" => (string)$u["player_avatar_id"],
-    "level" => (int)$u["level"],
-    "owned_morties" => $morties_by_player[$pid] ?? [],
-    "state" => ($u["state"] ?: "WORLD")
-  ];
+
+while ($u = $usersStmt->fetch(PDO::FETCH_ASSOC)) {
+
+    $deckStmt = $pdo->prepare("
+        SELECT owned_morty_ids
+        FROM decks
+        WHERE player_id = ?
+        AND deck_id = (
+            SELECT active_deck_id
+            FROM users
+            WHERE player_id = ?
+        )
+        LIMIT 1
+    ");
+    $deckStmt->execute([$u["player_id"], $u["player_id"]]);
+
+    $deck = $deckStmt->fetch(PDO::FETCH_ASSOC);
+
+    $mortyIds = json_decode($deck["owned_morty_ids"] ?? "[]", true);
+
+    $owned_morties = [];
+
+    if (!empty($mortyIds)) {
+        $placeholders = implode(",", array_fill(0, count($mortyIds), "?"));
+
+        $mortyStmt = $pdo->prepare("
+            SELECT *
+            FROM owned_morties
+            WHERE owned_morty_id IN ($placeholders)
+        ");
+        $mortyStmt->execute($mortyIds);
+
+        while ($m = $mortyStmt->fetch(PDO::FETCH_ASSOC)) {
+            $owned_morties[] = [
+                "owned_morty_id" => $m["owned_morty_id"],
+                "morty_id" => $m["morty_id"],
+                "hp" => (int)$m["hp"],
+                "variant" => $m["variant"] ?: "Normal",
+                "is_locked" => (bool)$m["is_locked"],
+                "is_trading_locked" => (bool)$m["is_trading_locked"],
+
+                // IMPORTANT FIX
+                "fight_pit_id" => !empty($m["fight_pit_id"])
+                    ? $m["fight_pit_id"]
+                    : null
+            ];
+        }
+    }
+
+    $users[] = [
+        "player_id" => $u["player_id"],
+        "username" => $u["username"],
+        "player_avatar_id" => $u["player_avatar_id"],
+        "level" => (int)$u["level"],
+        "owned_morties" => $owned_morties,
+        "state" => $u["state"] ?: "WORLD"
+    ];
 }
 
-// Snapshot from events (READ ONLY)
-$entities = build_room_snapshot_from_events($pdo, $room_id);
+/* ---------------- PICKUPS ---------------- */
 
-// Announce join
-publish_event($pdo, $room_id, "room:user-added", [
-  "player_id" => $my_player_id,
-  "username" => (string)$me["username"],
-  "player_avatar_id" => (string)$me["player_avatar_id"],
-  "level" => (int)$me["level"],
-  "owned_morties" => $morties_by_player[$my_player_id] ?? [],
-  "state" => "WORLD"
-]);
+$pickupStmt = $pdo->prepare("
+    SELECT pickup_id, placement, pick_up_contents
+    FROM event_queue
+    WHERE room_id = ?
+    AND event_name = 'room:pickup-added'
+    AND pickup_id_collected_by_player_id IS NULL
+");
+$pickupStmt->execute([$room_id]);
 
-$response = [
-  "room_id" => $room_id,
-  "room_udp_host" => $room_udp_host,
-  "room_udp_port" => $room_udp_port,
-  "world_id" => $world_id,
-  "zone_id" => $zone_id,
-  "incentive" => $incentive,
-  "users" => $users,
-  "pickups" => $entities["pickups"] ?? [],
-  "wild_morties" => $entities["wild_morties"] ?? [],
-  "bots" => $entities["bots"] ?? [],
-  "baseline_event_id" => $baseline_event_id
+$pickups = [];
+
+while ($p = $pickupStmt->fetch(PDO::FETCH_ASSOC)) {
+
+    $pos = explode(",", $p["placement"]);
+
+    $contents = json_decode($p["pick_up_contents"], true);
+
+    if (!is_array($contents)) {
+        $contents = [];
+    }
+
+    // force array format
+    if (isset($contents["type"])) {
+        $contents = [$contents];
+    }
+
+    $pickups[] = [
+        "pickup_id" => $p["pickup_id"],
+        "placement" => [
+            (int)$pos[0],
+            (int)$pos[1]
+        ],
+        "contents" => array_values($contents)
+    ];
+}
+
+/* ---------------- WILD MORTIES ---------------- */
+
+$wildStmt = $pdo->prepare("
+    SELECT *
+    FROM event_queue
+    WHERE room_id = ?
+    AND event_name = 'room:wild-morty-added'
+");
+$wildStmt->execute([$room_id]);
+
+$wild_morties = [];
+
+while ($w = $wildStmt->fetch(PDO::FETCH_ASSOC)) {
+
+    $pos = explode(",", $w["placement"]);
+
+    $wild_morties[] = [
+        "morty_id" => $w["morty_id"],
+        "placement" => [
+            (int)$pos[0],
+            (int)$pos[1]
+        ],
+        "state" => $w["state"] ?: "WORLD",
+        "division" => (int)$w["division"],
+        "variant" => $w["variant"] ?: "Normal",
+        "shiny_if_potion" => (bool)$w["shiny_if_potion"],
+        "_created" => iso8601_z($w["created_at"]),
+        "_updated" => iso8601_z($w["created_at"]),
+        "wild_morty_id" => $w["wild_morty_id"]
+    ];
+}
+
+/* ---------------- BOTS ---------------- */
+
+$botStmt = $pdo->prepare("
+    SELECT bot_id, username, player_avatar_id, placement, state, division, zone_id, shiny_if_potion, owned_morties
+    FROM event_queue
+    WHERE room_id = ?
+    AND event_name = 'room:bot-added'
+");
+
+$botStmt->execute([$room_id]);
+
+$bots = [];
+
+while ($b = $botStmt->fetch(PDO::FETCH_ASSOC)) {
+
+    $placement = isset($b["placement"]) ? explode(",", $b["placement"]) : [0, 0];
+
+    $bots[] = [
+        "username" => $b["username"],
+        "player_avatar_id" => $b["player_avatar_id"],
+		"state" => $b["state"],
+		"level" => 1,
+		"owned_morties" => json_decode($b["owned_morties"], true),
+        "shiny_if_potion" => (bool)$b["shiny_if_potion"],
+		"streak" => 0,
+        "bot_id" => $b["bot_id"],
+        "placement" => [(int)($placement[0] ?? 0),(int)($placement[1] ?? 0)]
+    ];
+}
+
+/* ---------------- FINAL RESPONSE ---------------- */
+
+echo json_encode([
+    "room_id" => $room["room_id"],
+    "room_udp_host" => $room["room_udp_host"],
+    "room_udp_port" => (string)$room["room_udp_port"],
+    "world_id" => (string)$room["world_id"],
+    "zone_id" => $room["zone_id"],
+
+    "incentive" => [
+        "incentive_id" => "NPCAd",
+        "rewards" => [
+            [
+                "type" => "ITEM",
+                "amount" => 1,
+                "item_id" => "ItemSerum",
+                "rarity" => 100
+            ],
+            [
+                "type" => "ITEM",
+                "amount" => 1,
+                "item_id" => "ItemParalysisCure",
+                "rarity" => 75
+            ],
+            [
+                "type" => "COIN",
+                "amount" => 200
+            ]
+        ],
+        "token" => ""
+    ],
+
+    "users" => $users,
+    "pickups" => $pickups,
+    "wild_morties" => $wild_morties,
+    "bots" => $bots,
+    //"baseline_event_id" => $baseline_event_id
+
+], JSON_UNESCAPED_SLASHES | JSON_NUMERIC_CHECK | JSON_PRESERVE_ZERO_FRACTION);
+
+/* ---------------- SEND TO SSE USER JOINED ROOM ---------------- */
+$payload = [
+"room_id" => $room_id,
+"player_id" => $player_id,
+"state" => "WORLD"
 ];
-
-echo json_encode($response, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+publish_event($pdo, $room_id, "room:user-added", $payload, $player_id);

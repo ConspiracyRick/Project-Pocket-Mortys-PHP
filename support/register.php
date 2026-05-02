@@ -1,6 +1,6 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . "/db.php";
+require __DIR__ . "/auth.php";
 
 if ($_SERVER["REQUEST_METHOD"] !== "POST") {
   respond(405, ["success" => false, "error" => "METHOD_NOT_ALLOWED"]);

@@ -16,7 +16,7 @@ echo '[{
 	"tag": "BattleWinPvWM",
 	"tag_id": null,
 	"challange_name": null,
-	"progress": 0,
+	"progress": 3,
 	"cooldown_expires": null,
 	"in_cooldown": false,
 	"end_time": "2026-01-28T04:59:59.999Z"

@@ -1,4 +1,6 @@
 <?php
+// /session/battle/move
+
 header("Content-Type: application/json; charset=utf-8");
 header("Access-Control-Allow-Origin: *");
 
@@ -57,12 +59,9 @@ if (!$battle) {
 // ========================
 // HELPERS
 // ========================
-function calculate_damage() {
-    return rand(5, 10);
-}
-
 function get_ai_move() {
-    $moves = ["AttackBatteringRam","AttackToxic","AttackVileSpew"];
+    $moves = ["AttackBatteringRam","AttackVileSpew"];
+	// $moves = ["AttackBatteringRam","AttackToxic","AttackVileSpew"];
     return $moves[array_rand($moves)];
 }
 function uuidv4(): string {
@@ -201,8 +200,8 @@ if ($type === "ITEM" && $move_id === "ItemMortyChip") {
 // ========================
 if ($type === "ATTACK") {
 
-    $player_damage = calculate_damage();
-    $ai_damage     = calculate_damage();
+    $player_damage = rand(20, 20);
+    $ai_damage     = rand(1, 3);
 
     $enemy_hp_after  = max($enemy_hp - $player_damage, 0);
     $player_hp_after = max($player_hp - $ai_damage, 0);
@@ -236,44 +235,87 @@ if ($type === "ATTACK") {
             ]]
         ]]
     ];
-
+    
+	// apply HP change first
+    $enemy_hp = $enemy_hp_after;
+	
+	// ========================
+    // CHECK FAINT BEFORE AI ACTS
+    // ========================
+    if ($enemy_hp > 0) {
     // --------------------
     // AI ATTACK SECOND
     // --------------------
-    $turn_datas[] = [
-        "type" => "ATTACK",
-        "attacker_player_id" => $battle["opponent_id"],
-        "defender_player_id" => $player_id,
-        "attack_id" => $ai_move,
-        "element_modifier" => 1,
-        "effect_datas" => [[
+$turn_datas[] = [
+    "type" => "ATTACK",
+    "attacker_player_id" => $battle["opponent_id"],
+    "defender_player_id" => $player_id,
+    "attack_id" => $ai_move,
+    "element_modifier" => $element_modifier ?? 1,
+
+    "effect_datas" => array_values(array_filter([
+        [
             "type" => "Hit",
             "is_accurate" => true,
             "to_self" => false,
-            "is_critical" => false,
+            "continue_on_miss" => false,
+            "is_critical" => $is_critical ?? false,
             "damage" => $ai_damage,
+
             "defender_morty_datas" => [[
                 "owned_morty_id" => $owned_morty_id,
                 "hp" => $player_hp_after
             ]]
-        ]],
-        "attacker_morty_datas" => [[
-            "owned_morty_id" => $battle["opponent_active_morty"],
-            "owned_attacks" => [[
-                "attack_id" => $ai_move,
-                "pp" => rand(1,5)
+        ],
+
+        isset($apply_poison) && $apply_poison ? [
+            "type" => "Poison",
+            "is_accurate" => true,
+            "to_self" => false,
+            "defender_morty_datas" => [[
+                "owned_morty_id" => $owned_morty_id,
+                "is_poisoned" => true
             ]]
+        ] : null
+    ])),
+
+    "attacker_morty_datas" => [[
+        "owned_morty_id" => $battle["opponent_active_morty"],
+        "owned_attacks" => [[
+            "attack_id" => $ai_move,
+            "pp" => $ai_attack_pp ?? 1
         ]]
-    ];
-
-    // Update HP
+    ]]
+];
+    // check player health after the ai attacks
     $player_hp = $player_hp_after;
-    $enemy_hp  = $enemy_hp_after;
-
-    if ($enemy_hp <= 0) {
-        $outcome = "WIN";
-    } elseif ($player_hp <= 0) {
-        $outcome = "LOSE";
+	if ($player_hp <= 0) {
+    $outcome = "LOSE";
+    }
+	} else {
+    // enemy fainted → no AI turn
+    $outcome = "WIN";
+	$xp_earned = 117; // replace with real formula later
+	$current_xp_earned = 100;
+	$update_total_xp = $current_xp_earned+$xp_earned;
+	$xp_lower = 100;
+	$update_xp_lower = $xp_lower+$xp_earned;
+	$xp_datas = [[
+    "owned_morty_id" => $owned_morty_id,
+    "xp_earned" => $xp_earned,
+    "owned_morty_datas" => [[
+        "level" => 6, // fetch updated from DB if possible
+        "xp" => $update_total_xp, // updated XP after adding
+        "hp" => 20,
+        "hp_stat" => 20,
+        "attack_stat" => 11,
+        "defence_stat" => 10,
+        "speed_stat" => 10,
+        "variant" => "Normal",
+        "xp_lower" => $update_xp_lower,
+        "xp_upper" => 225
+    ]]
+    ]];
     }
 }
 
@@ -282,6 +324,75 @@ if ($type === "ATTACK") {
 // ========================
 $stmt = $pdo->prepare("UPDATE battles SET player_hp=?, opponent_hp=? WHERE battle_id=?");
 $stmt->execute([$player_hp, $enemy_hp, $battle_id]);
+
+// ========================
+// IF RUN
+// ========================
+if ($type === "RUN") {
+$wild_morty_id = $battle["opponent_active_morty"];
+publish_event($pdo, $room_id, "room:wild-morty-state-changed", ["wild_morty_id"=>$wild_morty_id,"state"=>"WORLD"]);
+publish_event($pdo, $room_id, "room:user-state-changed", ["player_id"=>$player_id,"state"=>"WORLD"]);
+publish_event($pdo, $room_id, "battle:turn-result", [
+    "battle_id" => $battle_id,
+    "outcome" => "RUN",
+    "turn_datas" => $turn_datas,
+    "player_datas" => [
+        "player" => [
+		    "attacks_to_learn" => [],
+            "move_log" => [
+                "cooldown" => ["ATTACK" => 0, "RUN" => 0],
+                "count" => ["ATTACK" => count($turn_datas), "RUN" => 1],
+                "cooldown_next" => ["ITEM" => 1],
+                "last_move_type" => $type
+            ]
+        ],
+        "opponent" => (object)[]
+    ],
+	"battle_abandoned" => true
+], $player_id);
+}else{
+// ========================
+// IF WIN
+// ========================
+if ($outcome === "WIN") {
+$wild_morty_id = $battle["opponent_active_morty"];
+//publish_event($pdo, $room_id, "room:wild-morty-removed", ["wild_morty_id"=>$wild_morty_id);
+// for now
+publish_event($pdo, $room_id, "room:wild-morty-state-changed", ["wild_morty_id"=>$wild_morty_id,"state"=>"WORLD"]);
+publish_event($pdo, $room_id, "room:user-state-changed", ["player_id"=>$player_id,"state"=>"WORLD"]);
+
+publish_event($pdo, $room_id, "battle:turn-result", [
+    "battle_id" => $battle_id,
+    "outcome" => "WIN",
+    "turn_datas" => $turn_datas,
+
+    "player_datas" => [
+        "player" => [
+            "xp_datas" => $xp_datas,
+
+            "rewards" => [
+                [
+                    "type" => "ITEM",
+                    "item_id" => "ItemCircuitBoard",
+                    "quantity" => 10,
+                    "amount_received" => 0,
+                    "amount" => 1
+                ]
+            ],
+
+            "attacks_to_learn" => [],
+
+            "move_log" => [
+                "cooldown" => ["ATTACK" => 0],
+                "count" => ["ATTACK" => count($turn_datas)],
+                "cooldown_next" => ["ITEM" => 1],
+                "last_move_type" => $type
+            ]
+        ],
+        "opponent" => (object)[]
+    ]
+], $player_id);
+}else{
 
 // ========================
 // SEND STRICT SSE EVENT
@@ -302,32 +413,13 @@ publish_event($pdo, $room_id, "battle:turn-result", [
         "opponent" => (object)[]
     ]
 ], $player_id);
-
-// ========================
-// IF RUN
-// ========================
-if ($outcome === "RUN") {
-$wild_morty_id = $battle["opponent_active_morty"];
-publish_event($pdo, $room_id, "room:wild-morty-state-changed", ["wild_morty_id"=>$wild_morty_id,"state"=>"WORLD"]);
-publish_event($pdo, $room_id, "room:user-state-changed", ["player_id"=>$player_id,"state"=>"WORLD"]);
 }
-
+}
 // ========================
 // IF LOSE
 // ========================
 if ($outcome === "LOSE") {
 $wild_morty_id = $battle["opponent_active_morty"];
-publish_event($pdo, $room_id, "room:wild-morty-state-changed", ["wild_morty_id"=>$wild_morty_id,"state"=>"WORLD"]);
-publish_event($pdo, $room_id, "room:user-state-changed", ["player_id"=>$player_id,"state"=>"WORLD"]);
-}
-
-// ========================
-// IF WIN
-// ========================
-if ($outcome === "WIN") {
-$wild_morty_id = $battle["opponent_active_morty"];
-//publish_event($pdo, $room_id, "room:wild-morty-removed", ["wild_morty_id"=>$wild_morty_id);
-// for now
 publish_event($pdo, $room_id, "room:wild-morty-state-changed", ["wild_morty_id"=>$wild_morty_id,"state"=>"WORLD"]);
 publish_event($pdo, $room_id, "room:user-state-changed", ["player_id"=>$player_id,"state"=>"WORLD"]);
 }

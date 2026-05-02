@@ -11,15 +11,21 @@ $data = json_decode($input, true);
 $secret = $data['secret'];
 $consent_identifier = $data['consent_identifier'];
 
-if($secret !== '4f0b1131-08d0-449c-9f6e-c70241b8cb70'){
-http_response_code(400);
-$error = json_encode([
-    "error" => [
-        "code" => "MAINTENANCE"
-    ]
-], JSON_UNESCAPED_SLASHES);
-echo $error;
-exit;
+$allowedSecrets = [
+    '4f0b1131-08d0-449c-9f6e-c70241b8cb70',
+    '9af289a7-1bd7-471b-8a96-23926e244967'
+];
+
+if (!in_array($secret, $allowedSecrets, true)) {
+    http_response_code(400);
+
+    echo json_encode([
+        "error" => [
+            "code" => "MAINTENANCE"
+        ]
+    ], JSON_UNESCAPED_SLASHES);
+
+    exit;
 }
 
 require '../../pocket_f4894h398r8h9w9er8he98he.php';
