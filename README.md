@@ -6,10 +6,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ConspiracyRick/Pocket-Mortys-Public-Server/releases">
-    <img src="https://img.shields.io/badge/Version-2.41.0-blue?style=for-the-badge" />
-  </a>
-  <img src="https://img.shields.io/badge/status-online-brightgreen?style=for-the-badge&logo=server&logoColor=white" />
   <img src="https://img.shields.io/badge/php-8.x-777bb4?style=for-the-badge&amp;logo=github" />
   <img src="https://img.shields.io/badge/license-MIT-blue?style=for-the-badge&amp;logo=github" />
 </p>
@@ -73,8 +69,8 @@ Use GitHub Issues for bug reports and feature requests.
 
 This project is licensed under the MIT License.
 
-If you use this code in another project, server, or fork,
-you **must credit**:
+If you use this code in another project, server, fork, clone or convert this code, 
 
-**ConspiracyRick – Project Pocket Mortys**
+You **MUST credit**: **ConspiracyRick – Project Pocket Mortys** for all the work done.
+
 https://github.com/ConspiracyRick/Project-Pocket-Mortys
